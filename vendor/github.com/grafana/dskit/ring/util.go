@@ -138,10 +138,15 @@ func waitStability(ctx context.Context, r ReadRing, op Operation, minStability, 
 }
 
 // MakeBuffersForGet returns buffers to use with Ring.Get().
-func MakeBuffersForGet() (bufDescs []InstanceDesc, bufHosts, bufZones []string) {
-	bufDescs = make([]InstanceDesc, 0, GetBufferSize)
-	bufHosts = make([]string, 0, GetBufferSize)
-	bufZones = make([]string, 0, GetBufferSize)
+func MakeBuffersForGet() ([]InstanceDesc, []string, []string) {
+	return MakeBuffersForGetWithSize(GetBufferSize)
+}
+
+// MakeBuffersForGet returns buffers to use with Ring.Get().
+func MakeBuffersForGetWithSize(size int) (bufDescs []InstanceDesc, bufHosts, bufZones []string) {
+	bufDescs = make([]InstanceDesc, 0, size)
+	bufHosts = make([]string, 0, size)
+	bufZones = make([]string, 0, size)
 	return
 }
 
