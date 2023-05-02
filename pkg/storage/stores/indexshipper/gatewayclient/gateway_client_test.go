@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/grafana/dskit/flagext"
 	"github.com/prometheus/client_golang/prometheus"
@@ -308,4 +309,32 @@ func TestDoubleRegistration(t *testing.T) {
 	client, err = NewGatewayClient(clientCfg, r, util_log.Logger)
 	require.NoError(t, err)
 	defer client.Stop()
+}
+
+func TestPerTenantRate(t *testing.T) {
+	t.Run("observing increases counter within window", func(t *testing.T) {
+		r := newRateStore(time.Second)
+		for i := 0; i < 9; i++ {
+			res := r.Observe("tenant")
+			require.Equal(t, float64(i), res)
+			time.Sleep(10 * time.Millisecond)
+		}
+		require.Equal(t, 9.0, r.Observe("tenant"))
+	})
+
+	t.Run("observing rate truncates bucket", func(t *testing.T) {
+		now := time.Now()
+		r := &rateStore{
+			mapping: make(map[string][]time.Time),
+			window:  time.Second,
+		}
+		r.mapping["tenant"] = []time.Time{
+			now.Add(-1750 * time.Millisecond),
+			now.Add(-1500 * time.Millisecond),
+			now.Add(-500 * time.Millisecond),
+			now.Add(-250 * time.Millisecond),
+		}
+		require.Equal(t, 2.0, r.Observe("tenant"))
+		require.Len(t, r.mapping["tenant"], 3)
+	})
 }

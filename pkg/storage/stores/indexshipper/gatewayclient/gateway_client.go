@@ -5,7 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -33,6 +35,42 @@ const (
 	maxQueriesPerGrpc      = 100
 	maxConcurrentGrpcCalls = 10
 )
+
+type rateStore struct {
+	// memory consumption could be optimized by using an uint64
+	mapping map[string][]time.Time
+	window  time.Duration
+	size    int
+}
+
+func newRateStore(window time.Duration) *rateStore {
+	return &rateStore{
+		mapping: make(map[string][]time.Time),
+		window:  window,
+		size:    int(window.Seconds()) * 10, // accounts for 10rps
+	}
+}
+
+func (mr *rateStore) Observe(key string) float64 {
+	now := time.Now()
+	ptr, ok := mr.mapping[key]
+	count := 0
+	if !ok {
+		fifo := make([]time.Time, 0, mr.size)
+		fifo = append(fifo, now)
+		mr.mapping[key] = fifo
+	} else {
+		ago := now.Add(-1 * mr.window)
+		for i := len(ptr) - 1; i >= 0; i-- {
+			if ptr[i].Before(ago) {
+				break
+			}
+			count++
+		}
+	}
+	mr.mapping[key] = append(ptr[len(ptr)-count:], now)
+	return float64(count) / mr.window.Seconds()
+}
 
 // IndexGatewayClientConfig configures the Index Gateway client used to
 // communicate with the Index Gateway server.
@@ -71,6 +109,14 @@ type IndexGatewayClientConfig struct {
 	// LogGatewayRequests configures if requests sent to the gateway should be logged or not.
 	// The log messages are of type debug and contain the address of the gateway and the relevant tenant.
 	LogGatewayRequests bool `yaml:"log_gateway_requests"`
+
+	// RateLowerBound configures the lower bound for dymanic replication factor calculation
+	// This setting is temporary to simplify testing.
+	RateLowerBound float64 `yaml:"-"`
+
+	// RateUpperBound configures the upper bound for dymanic replication factor calculation
+	// This setting is temporary to simplify testing.
+	RateUpperBound float64 `yaml:"-"`
 }
 
 // RegisterFlagsWithPrefix register client-specific flags with the given prefix.
@@ -80,6 +126,8 @@ func (i *IndexGatewayClientConfig) RegisterFlagsWithPrefix(prefix string, f *fla
 	i.GRPCClientConfig.RegisterFlagsWithPrefix(prefix+".grpc", f)
 	f.StringVar(&i.Address, prefix+".server-address", "", "Hostname or IP of the Index Gateway gRPC server running in simple mode.")
 	f.BoolVar(&i.LogGatewayRequests, prefix+".log-gateway-requests", false, "Whether requests sent to the gateway should be logged or not.")
+	f.Float64Var(&i.RateLowerBound, prefix+".rate-lower-bound", 0.2, "Lower bound for dynamic RF calculation.")
+	f.Float64Var(&i.RateUpperBound, prefix+".rate-upper-bound", 1.2, "Upper bound for dynamic RF calculation.")
 }
 
 func (i *IndexGatewayClientConfig) RegisterFlags(f *flag.FlagSet) {
@@ -94,9 +142,9 @@ type GatewayClient struct {
 	conn       *grpc.ClientConn
 	grpcClient logproto.IndexGatewayClient
 
-	pool *ring_client.Pool
-
-	ring ring.ReadRing
+	pool      *ring_client.Pool
+	rateStore *rateStore
+	ring      ring.ReadRing
 }
 
 // NewGatewayClient instantiates a new client used to communicate with an Index Gateway instance.
@@ -143,6 +191,7 @@ func NewGatewayClient(cfg IndexGatewayClientConfig, r prometheus.Registerer, log
 		}
 
 		sgClient.pool = clientpool.NewPool(cfg.PoolConfig, sgClient.ring, factory, logger)
+		sgClient.rateStore = newRateStore(time.Minute)
 	} else {
 		sgClient.conn, err = grpc.Dial(cfg.Address, dialOpts...)
 		if err != nil {
@@ -313,6 +362,14 @@ func (s *GatewayClient) clientDoQueries(ctx context.Context, gatewayQueries []*l
 	return nil
 }
 
+func (s *GatewayClient) replicationFactorForTenant(tenant string) int {
+	maxRF := s.ring.InstancesCount()
+	minRF := s.cfg.Ring.ReplicationFactor()
+	rate := s.rateStore.Observe(tenant)
+	factor := math.Min(s.cfg.RateUpperBound, math.Max(0, rate-s.cfg.RateLowerBound)/(s.cfg.RateUpperBound-s.cfg.RateLowerBound))
+	return minRF + int(factor*float64(maxRF-minRF))
+}
+
 // ringModeDo executes the given function for each Index Gateway instance in the ring mapping to the correct tenant in the index.
 // In case of callback failure, we'll try another member of the ring for that tenant ID.
 func (s *GatewayClient) ringModeDo(ctx context.Context, callback func(client logproto.IndexGatewayClient) error) error {
@@ -323,8 +380,9 @@ func (s *GatewayClient) ringModeDo(ctx context.Context, callback func(client log
 
 	bufDescs, bufHosts, bufZones := ring.MakeBuffersForGet()
 
+	rf := s.replicationFactorForTenant(userID)
 	key := util.TokenFor(userID, "" /* labels */)
-	rs, err := s.ring.Get(key, ring.WriteNoExtend, bufDescs, bufHosts, bufZones)
+	rs, err := s.ring.GetWithRF(key, ring.WriteNoExtend, bufDescs, bufHosts, bufZones, rf)
 	if err != nil {
 		return errors.Wrap(err, "index gateway get ring")
 	}
