@@ -26,6 +26,17 @@ import (
 	"github.com/grafana/loki/pkg/validation"
 )
 
+type PushErrReason string
+
+const (
+	PushErrPSRL          = "per-stream-rate-limit"
+	PushErrInvalidLabels = "invalid-labels"
+	PushErrLineTooLong   = "line-too-long"
+	PushErrTooFarBehind  = "too-far-behind"
+	PushErrOutOfOrder    = "out-of-order"
+	PushErrAppendFailure = "append-failure"
+)
+
 var ErrEntriesExist = errors.New("duplicate push - entries already exist")
 
 type line struct {
@@ -144,6 +155,11 @@ func (s *stream) NewChunk() *chunkenc.MemChunk {
 	return chunkenc.NewMemChunk(s.cfg.parsedEncoding, headBlockType(s.unorderedWrites), s.cfg.BlockSize, s.cfg.TargetChunkSize)
 }
 
+type ingesterPushErr struct {
+	err             error
+	entriesByReason map[PushErrReason][]entryWithError
+}
+
 func (s *stream) Push(
 	ctx context.Context,
 	entries []logproto.Entry,
@@ -160,7 +176,7 @@ func (s *stream) Push(
 	lockChunk bool,
 	// Whether nor not to ingest all at once or not. It is a per-tenant configuration.
 	rateLimitWholeStream bool,
-) (int, error) {
+) (int, int, *ingesterPushErr) {
 	if lockChunk {
 		s.chunkMtx.Lock()
 		defer s.chunkMtx.Unlock()
@@ -175,12 +191,12 @@ func (s *stream) Push(
 
 		s.metrics.walReplaySamplesDropped.WithLabelValues(duplicateReason).Add(float64(len(entries)))
 		s.metrics.walReplayBytesDropped.WithLabelValues(duplicateReason).Add(float64(byteCt))
-		return 0, ErrEntriesExist
+		return 0, 0, &ingesterPushErr{err: ErrEntriesExist}
 	}
 
 	toStore, invalid := s.validateEntries(entries, isReplay, rateLimitWholeStream)
-	if rateLimitWholeStream && hasRateLimitErr(invalid) {
-		return 0, errorForFailedEntries(s, invalid, len(entries))
+	if rateLimitWholeStream && invalid[PushErrPSRL] != nil && len(invalid[PushErrPSRL]) > 0 {
+		return 0, 0, &ingesterPushErr{entriesByReason: invalid}
 	}
 
 	prevNumChunks := len(s.chunks)
@@ -192,16 +208,22 @@ func (s *stream) Push(
 		s.metrics.chunkCreatedStats.Inc(1)
 	}
 
-	bytesAdded, storedEntries, entriesWithErr := s.storeEntries(ctx, toStore)
+	bytesAdded, storedEntries, storeFailures := s.storeEntries(ctx, toStore)
 	s.recordAndSendToTailers(record, storedEntries)
 
 	if len(s.chunks) != prevNumChunks {
 		s.metrics.memoryChunks.Add(float64(len(s.chunks) - prevNumChunks))
 	}
 
-	return bytesAdded, errorForFailedEntries(s, append(invalid, entriesWithErr...), len(entries))
+	// merge storeFailures with invalid to have all errors on a single map.
+	for reason, _ := range storeFailures {
+		// copy from storeFailures to invalid.
+		invalid[reason] = storeFailures[reason]
+	}
+	return bytesAdded, len(entries), &ingesterPushErr{entriesByReason: invalid}
 }
 
+// errorForFailedEntries builds a unified error for all given errored entries.
 func errorForFailedEntries(s *stream, failedEntriesWithError []entryWithError, totalEntries int) error {
 	if len(failedEntriesWithError) == 0 {
 		return nil
@@ -231,23 +253,13 @@ func errorForFailedEntries(s *stream, failedEntriesWithError []entryWithError, t
 
 	for _, entryWithError := range limitedFailedEntries {
 		fmt.Fprintf(&buf,
-			"entry with timestamp %s ignored, reason: '%s' for stream: %s,\n",
+			"entry with timestamp %s ignored, reason: '%s' for stream: %s,\n", // TODO: appending the stream for every error message, looks wrong.
 			entryWithError.entry.Timestamp.String(), entryWithError.e.Error(), streamName)
 	}
 
 	fmt.Fprintf(&buf, "user '%s', total ignored: %d out of %d", s.tenant, len(failedEntriesWithError), totalEntries)
 
 	return httpgrpc.Errorf(statusCode, buf.String())
-}
-
-func hasRateLimitErr(errs []entryWithError) bool {
-	if len(errs) == 0 {
-		return false
-	}
-
-	lastErr := errs[len(errs)-1]
-	_, ok := lastErr.e.(*validation.ErrStreamRateLimit)
-	return ok
 }
 
 func (s *stream) recordAndSendToTailers(record *wal.Record, entries []logproto.Entry) {
@@ -294,7 +306,7 @@ func (s *stream) recordAndSendToTailers(record *wal.Record, entries []logproto.E
 	}
 }
 
-func (s *stream) storeEntries(ctx context.Context, entries []logproto.Entry) (int, []logproto.Entry, []entryWithError) {
+func (s *stream) storeEntries(ctx context.Context, entries []logproto.Entry) (int, []logproto.Entry, map[PushErrReason][]entryWithError) {
 	if sp := opentracing.SpanFromContext(ctx); sp != nil {
 		sp.LogKV("event", "stream started to store entries", "labels", s.labelsString)
 		defer sp.LogKV("event", "stream finished to store entries")
@@ -302,7 +314,7 @@ func (s *stream) storeEntries(ctx context.Context, entries []logproto.Entry) (in
 
 	var bytesAdded, outOfOrderSamples, outOfOrderBytes int
 
-	var invalid []entryWithError
+	var invalid map[PushErrReason][]entryWithError
 	storedEntries := make([]logproto.Entry, 0, len(entries))
 	for i := 0; i < len(entries); i++ {
 		chunk := &s.chunks[len(s.chunks)-1]
@@ -312,10 +324,12 @@ func (s *stream) storeEntries(ctx context.Context, entries []logproto.Entry) (in
 
 		chunk.lastUpdated = time.Now()
 		if err := chunk.chunk.Append(&entries[i]); err != nil {
-			invalid = append(invalid, entryWithError{&entries[i], err})
 			if chunkenc.IsOutOfOrderErr(err) {
+				invalid[PushErrOutOfOrder] = append(invalid[PushErrOutOfOrder], entryWithError{&entries[i], err})
 				outOfOrderSamples++
 				outOfOrderBytes += len(entries[i].Line)
+			} else {
+				invalid[PushErrAppendFailure] = append(invalid[PushErrAppendFailure], entryWithError{&entries[i], err})
 			}
 			continue
 		}
@@ -334,12 +348,12 @@ func (s *stream) storeEntries(ctx context.Context, entries []logproto.Entry) (in
 	return bytesAdded, storedEntries, invalid
 }
 
-func (s *stream) validateEntries(entries []logproto.Entry, isReplay, rateLimitWholeStream bool) ([]logproto.Entry, []entryWithError) {
+func (s *stream) validateEntries(entries []logproto.Entry, isReplay, rateLimitWholeStream bool) ([]logproto.Entry, map[PushErrReason][]entryWithError) {
 	var (
 		outOfOrderSamples, outOfOrderBytes   int
 		rateLimitedSamples, rateLimitedBytes int
 		validBytes, totalBytes               int
-		failedEntriesWithError               []entryWithError
+		failedEntriesWithError               map[PushErrReason][]entryWithError
 		limit                                = s.limiter.lim.Limit()
 		lastLine                             = s.lastLine
 		highestTs                            = s.highestTs
@@ -364,7 +378,7 @@ func (s *stream) validateEntries(entries []logproto.Entry, isReplay, rateLimitWh
 
 		now := time.Now()
 		if !rateLimitWholeStream && !s.limiter.AllowN(now, len(entries[i].Line)) {
-			failedEntriesWithError = append(failedEntriesWithError, entryWithError{&entries[i], &validation.ErrStreamRateLimit{RateLimit: flagext.ByteSize(limit), Labels: s.labelsString, Bytes: flagext.ByteSize(lineBytes)}})
+			failedEntriesWithError[PushErrPSRL] = append(failedEntriesWithError[PushErrPSRL], entryWithError{&entries[i], &validation.ErrStreamRateLimit{RateLimit: flagext.ByteSize(limit), Labels: s.labelsString, Bytes: flagext.ByteSize(lineBytes)}})
 			rateLimitedSamples++
 			rateLimitedBytes += lineBytes
 			continue
@@ -373,7 +387,7 @@ func (s *stream) validateEntries(entries []logproto.Entry, isReplay, rateLimitWh
 		// The validity window for unordered writes is the highest timestamp present minus 1/2 * max-chunk-age.
 		cutoff := highestTs.Add(-s.cfg.MaxChunkAge / 2)
 		if !isReplay && s.unorderedWrites && !highestTs.IsZero() && cutoff.After(entries[i].Timestamp) {
-			failedEntriesWithError = append(failedEntriesWithError, entryWithError{&entries[i], chunkenc.ErrTooFarBehind(cutoff)})
+			failedEntriesWithError[PushErrTooFarBehind] = append(failedEntriesWithError[PushErrTooFarBehind], entryWithError{&entries[i], chunkenc.ErrTooFarBehind(cutoff)})
 			outOfOrderSamples++
 			outOfOrderBytes += lineBytes
 			continue
@@ -397,9 +411,10 @@ func (s *stream) validateEntries(entries []logproto.Entry, isReplay, rateLimitWh
 	if rateLimitWholeStream && !s.limiter.AllowN(now, validBytes) {
 		// Report that the whole stream was rate limited
 		rateLimitedSamples = len(toStore)
-		failedEntriesWithError = make([]entryWithError, 0, len(toStore))
+		failedEntriesWithError[PushErrPSRL] = make([]entryWithError, 0, len(toStore))
+
 		for i := 0; i < len(toStore); i++ {
-			failedEntriesWithError = append(failedEntriesWithError, entryWithError{&toStore[i], &validation.ErrStreamRateLimit{RateLimit: flagext.ByteSize(limit), Labels: s.labelsString, Bytes: flagext.ByteSize(len(toStore[i].Line))}})
+			failedEntriesWithError[PushErrPSRL] = append(failedEntriesWithError[PushErrPSRL], entryWithError{&toStore[i], &validation.ErrStreamRateLimit{RateLimit: flagext.ByteSize(limit), Labels: s.labelsString, Bytes: flagext.ByteSize(len(toStore[i].Line))}})
 			rateLimitedBytes += len(toStore[i].Line)
 		}
 	}

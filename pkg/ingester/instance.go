@@ -8,6 +8,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -18,6 +19,7 @@ import (
 	tsdb_record "github.com/prometheus/prometheus/tsdb/record"
 	"github.com/weaveworks/common/httpgrpc"
 	"go.uber.org/atomic"
+	"golang.org/x/time/rate"
 
 	"github.com/grafana/loki/pkg/analytics"
 	"github.com/grafana/loki/pkg/ingester/index"
@@ -90,8 +92,9 @@ type instance struct {
 	tailers   map[uint32]*tailer
 	tailerMtx sync.RWMutex
 
-	limiter *Limiter
-	configs *runtime.TenantConfigs
+	limiter              *Limiter
+	errorsLoggingLimiter map[string]map[PushErrReason]*rate.Limiter // tenant -> reason -> limiter
+	configs              *runtime.TenantConfigs
 
 	wal WAL
 
@@ -173,6 +176,49 @@ func (i *instance) consumeChunk(ctx context.Context, ls labels.Labels, chunk *lo
 	return err
 }
 
+func logPushErrorV2(cfg *logPushesV2Cfg, logger log.Logger, pushErr *ingesterPushErr, reasonToLimiters map[PushErrReason]*rate.Limiter, now time.Time, stream string) {
+	if cfg == nil {
+		return
+	}
+
+	if pushErr.err == nil && len(pushErr.entriesByReason) == 0 {
+		// no error happened, nothing to log.
+		return
+	}
+
+	if pushErr.err != nil && cfg.CompletePushErrLimits <= 0 {
+		// we're dealing with a systematic push error
+
+		level.Warn(util_log.Logger).Log("msg", "whole push failed", "reason", PushErrAppendFailure, "description", "blaaa", "stream", stream, "type", "complete")
+		return
+	}
+
+	if !cfg.Enabled || cfg.PartialPushErrLimits <= 0 {
+		return
+	}
+
+	for seenReason, _ := range pushErr.entriesByReason {
+		if _, ok := reasonToLimiters[seenReason]; !ok {
+			reasonToLimiters[seenReason] = rate.NewLimiter(rate.Every(time.Minute/time.Duration(cfg.PartialPushErrLimits)), int(cfg.LogBurstLimitsPerReason[seenReason]))
+		}
+
+		limiter := reasonToLimiters[seenReason]
+
+		maxAllowedLogs := limiter.Tokens()
+
+		desired := math.Min(int(maxAllowedLogs), len(pushErr.entriesByReason[seenReason]))
+		if !limiter.AllowN(now, desired) {
+			continue
+		}
+
+		for i := 0; i < desired; i++ {
+			entry := pushErr.entriesByReason[seenReason]
+			level.Warn(logger).Log("msg", "entry push failed", "reason", seenReason, "description", entry[i].e, "stream", stream)
+		}
+	}
+
+}
+
 // Push will iterate over the given streams present in the PushRequest and attempt to store them.
 //
 // Although multiple streams are part of the PushRequest, the returned error only reflects what
@@ -183,6 +229,7 @@ func (i *instance) Push(ctx context.Context, req *logproto.PushRequest) error {
 	record.UserID = i.instanceID
 	defer recordPool.PutRecord(record)
 	rateLimitWholeStream := i.limiter.limits.ShardStreams(i.instanceID).Enabled
+	now := time.Now()
 
 	var appendErr error
 	for _, reqStream := range req.Streams {
@@ -206,7 +253,28 @@ func (i *instance) Push(ctx context.Context, req *logproto.PushRequest) error {
 			continue
 		}
 
-		_, appendErr = s.Push(ctx, reqStream.Entries, record, 0, false, rateLimitWholeStream)
+		_, entriesInserted, pushErr := s.Push(ctx, reqStream.Entries, record, 0, false, rateLimitWholeStream)
+
+		logPushesCfg := i.limiter.limits.LogPushesV2(i.instanceID)
+		if logPushesCfg != nil {
+			logPushErrorV2(logPushesCfg, util_log.Logger, pushErr, i.errorsLoggingLimiter[i.instanceID], now, s.labelsString)
+		}
+
+		if pushErr.err != nil {
+			// push has a systematic error.
+			appendErr = pushErr.err
+		}
+
+		if pushErr.err == nil {
+			// not a systematic error, it was a partial error instead.
+
+			// merge all different errors on a final slice.
+			var allFailedEntries []entryWithError
+			for reason, _ := range pushErr.entriesByReason {
+				allFailedEntries = append(allFailedEntries, pushErr.entriesByReason[reason]...)
+			}
+			appendErr = errorForFailedEntries(s, allFailedEntries, entriesInserted)
+		}
 		s.chunkMtx.Unlock()
 	}
 
