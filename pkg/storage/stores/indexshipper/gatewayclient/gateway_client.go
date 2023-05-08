@@ -37,38 +37,37 @@ const (
 )
 
 type rateStore struct {
-	// memory consumption could be optimized by using an uint64
-	mapping map[string][]time.Time
-	window  time.Duration
-	size    int
+	mapping  map[string][]time.Time // memory consumption could be optimized by using an uint64
+	window   time.Duration
+	capacity int
 }
 
 func newRateStore(window time.Duration) *rateStore {
 	return &rateStore{
-		mapping: make(map[string][]time.Time),
-		window:  window,
-		size:    int(window.Seconds()) * 10, // accounts for 10rps
+		mapping:  make(map[string][]time.Time),
+		window:   window,
+		capacity: int(window.Seconds()) * 10, // accounts for 10rps
 	}
 }
 
 func (mr *rateStore) Observe(key string) float64 {
 	now := time.Now()
-	ptr, ok := mr.mapping[key]
+	val, ok := mr.mapping[key]
 	count := 0
 	if !ok {
-		fifo := make([]time.Time, 0, mr.size)
+		fifo := make([]time.Time, 0, mr.capacity)
 		fifo = append(fifo, now)
 		mr.mapping[key] = fifo
 	} else {
 		ago := now.Add(-1 * mr.window)
-		for i := len(ptr) - 1; i >= 0; i-- {
-			if ptr[i].Before(ago) {
+		for i := len(val) - 1; i >= 0; i-- {
+			if val[i].Before(ago) {
 				break
 			}
 			count++
 		}
 	}
-	mr.mapping[key] = append(ptr[len(ptr)-count:], now)
+	mr.mapping[key] = append(val[len(val)-count:], now)
 	return float64(count) / mr.window.Seconds()
 }
 
