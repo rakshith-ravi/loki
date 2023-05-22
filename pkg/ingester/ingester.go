@@ -1080,6 +1080,9 @@ func (i *Ingester) Series(ctx context.Context, req *logproto.SeriesRequest) (*lo
 }
 
 func (i *Ingester) GetStats(ctx context.Context, req *logproto.IndexStatsRequest) (*logproto.IndexStatsResponse, error) {
+	sp, ctx := opentracing.StartSpanFromContext(ctx, "Ingester.GetStats")
+	defer sp.Finish()
+
 	user, err := tenant.TenantID(ctx)
 	if err != nil {
 		return nil, err
@@ -1094,6 +1097,13 @@ func (i *Ingester) GetStats(ctx context.Context, req *logproto.IndexStatsRequest
 	if err != nil {
 		return nil, err
 	}
+
+	sp.LogKV(
+		"user", user,
+		"from", req.From.Time(),
+		"through", req.Through.Time(),
+		"matchers", syntax.MatchersString(matchers),
+	)
 
 	type f func() (*logproto.IndexStatsResponse, error)
 	jobs := []f{
@@ -1120,6 +1130,13 @@ func (i *Ingester) GetStats(ctx context.Context, req *logproto.IndexStatsRequest
 	}
 
 	merged := index_stats.MergeStats(resps...)
+	sp.LogKV(
+		"streams", merged.Streams,
+		"chunks", merged.Chunks,
+		"bytes", merged.Bytes,
+		"entries", merged.Entries,
+	)
+
 	return &merged, nil
 }
 

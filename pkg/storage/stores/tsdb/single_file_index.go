@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/go-kit/log/level"
+	"github.com/grafana/loki/pkg/logql/syntax"
+	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 
@@ -276,6 +278,17 @@ func (i *TSDBIndex) Identifier(string) SingleTenantTSDBIdentifier {
 }
 
 func (i *TSDBIndex) Stats(ctx context.Context, userID string, from, through model.Time, acc IndexStatsAccumulator, shard *index.ShardAnnotation, shouldIncludeChunk shouldIncludeChunk, matchers ...*labels.Matcher) error {
+	sp, ctx := opentracing.StartSpanFromContext(ctx, "TSDBIndex.Stats")
+	defer sp.Finish()
+
+	sp.LogKV(
+		"user", userID,
+		"from", from,
+		"through", through,
+		"matchers", syntax.MatchersString(matchers),
+		"shard", shard.String(),
+	)
+
 	return i.forPostings(ctx, shard, from, through, matchers, func(p index.Postings) error {
 		// TODO(owen-d): use pool
 		var ls labels.Labels

@@ -172,6 +172,9 @@ func (c *IndexClient) LabelNamesForMetricName(ctx context.Context, userID string
 }
 
 func (c *IndexClient) Stats(ctx context.Context, userID string, from, through model.Time, matchers ...*labels.Matcher) (*stats.Stats, error) {
+	sp, ctx := opentracing.StartSpanFromContext(ctx, "IndexClient.Stats")
+	defer sp.Finish()
+
 	matchers, shard, err := cleanMatchers(matchers...)
 	if err != nil {
 		return nil, err
@@ -198,6 +201,14 @@ func (c *IndexClient) Stats(ctx context.Context, userID string, from, through mo
 		})
 	})
 
+	sp.LogKV(
+		"from", from.Time(),
+		"through", through.Time(),
+		"matchers", syntax.MatchersString(matchers),
+		"shard", shard.String(),
+		"intervals", len(intervals),
+	)
+
 	var acc IndexStatsAccumulator
 	if c.opts.UseBloomFilters {
 		blooms := stats.BloomPool.Get()
@@ -217,6 +228,13 @@ func (c *IndexClient) Stats(ctx context.Context, userID string, from, through mo
 		return nil, err
 	}
 	res := acc.Stats()
+
+	sp.LogKV(
+		"streams", res.Streams,
+		"chunks", res.Chunks,
+		"bytes", res.Bytes,
+		"entries", res.Entries,
+	)
 
 	return &res, nil
 }
