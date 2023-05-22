@@ -61,7 +61,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.ShardedQueries, "querier.parallelise-shardable-queries", true, "Perform query parallelisations based on storage sharding configuration and query ASTs. This feature is supported only by the chunks storage engine.")
 	f.Var(&cfg.ForwardHeaders, "frontend.forward-headers-list", "List of headers forwarded by the query Frontend to downstream querier.")
 	cfg.ResultsCacheConfig.RegisterFlags(f)
-	cfg.StatsCacheConfig.RegisterFlagsWithPrefix(f, "frontend.index-stats-results-cache.")
+	// cfg.StatsCacheConfig.RegisterFlagsWithPrefix(f, "frontend.index-stats-results-cache.")
 }
 
 // Validate validates the config.
