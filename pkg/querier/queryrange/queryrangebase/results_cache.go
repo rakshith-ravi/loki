@@ -239,6 +239,14 @@ func (s resultsCache) Do(ctx context.Context, r Request) (Response, error) {
 		response Response
 	)
 
+	sp.LogKV(
+		"query", r.GetQuery(),
+		"step", r.GetStep(),
+		"start", r.GetStart(),
+		"end", r.GetEnd(),
+		"key", key,
+	)
+
 	cacheFreshnessCapture := func(id string) time.Duration { return s.limits.MaxCacheFreshness(ctx, id) }
 	maxCacheFreshness := validation.MaxDurationPerTenant(tenantIDs, cacheFreshnessCapture)
 	maxCacheTime := int64(model.Now().Add(-maxCacheFreshness))
@@ -258,6 +266,11 @@ func (s resultsCache) Do(ctx context.Context, r Request) (Response, error) {
 		if err != nil {
 			return nil, err
 		}
+
+		sp.LogKV(
+			"event", "put to cache",
+			"extents", len(extents),
+		)
 		s.put(ctx, key, extents)
 	}
 
@@ -416,6 +429,12 @@ func (s resultsCache) handleHit(ctx context.Context, r Request, extents []Extent
 		// No downstream requests so no need to write back to the cache.
 		return response, nil, err
 	}
+
+	sp.LogKV(
+		"extents in cache", len(extents),
+		"found responses", len(responses),
+		"pending requests", len(requests),
+	)
 
 	tenantIDs, err := tenant.TenantIDs(ctx)
 	if err != nil {
