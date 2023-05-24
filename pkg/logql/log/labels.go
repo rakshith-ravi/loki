@@ -1,6 +1,7 @@
 package log
 
 import (
+	"github.com/cespare/xxhash"
 	"github.com/prometheus/prometheus/model/labels"
 	"golang.org/x/exp/slices"
 
@@ -55,9 +56,28 @@ func newHasher() *hasher {
 
 // Hash hashes the labels
 func (h *hasher) Hash(lbs labels.Labels) uint64 {
-	var hash uint64
-	hash, h.buf = lbs.HashWithoutLabels(h.buf, []string(nil)...)
-	return hash
+	b := h.buf[:0]
+	lbs.Range(func(l labels.Label) {
+		b = append(b, l.Name...)
+		b = append(b, '\xff')
+		b = append(b, l.Value...)
+		b = append(b, '\xff')
+	})
+	h.buf = b
+	return xxhash.Sum64(b)
+}
+
+// HashSlice hashes a slice of labels, consistent with Hash()
+func (h *hasher) HashSlice(ls []labels.Label) uint64 {
+	b := h.buf[:0]
+	for i := range ls {
+		b = append(b, ls[i].Name...)
+		b = append(b, '\xff')
+		b = append(b, ls[i].Value...)
+		b = append(b, '\xff')
+	}
+	h.buf = b
+	return xxhash.Sum64(b)
 }
 
 // BaseLabelsBuilder is a label builder used by pipeline and stages.
@@ -324,11 +344,15 @@ func (b *LabelsBuilder) LabelsResult() LabelsResult {
 }
 
 func (b *BaseLabelsBuilder) toResult(buf []labels.Label) LabelsResult {
-	hash := b.hasher.Hash(buf)
+	hash := b.hasher.HashSlice(buf)
 	if cached, ok := b.resultCache[hash]; ok {
 		return cached
 	}
-	res := NewLabelsResult(buf.Copy(), hash)
+	sb := labels.NewScratchBuilder(len(buf))
+	for _, l := range buf {
+		sb.Add(l.Name, l.Value)
+	}
+	res := NewLabelsResult(sb.Labels(), hash)
 	b.resultCache[hash] = res
 	return res
 }
